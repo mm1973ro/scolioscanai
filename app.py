@@ -11,12 +11,14 @@ from helpers.util import (
     generate_pdf_report,
     load_sam,
     load_medsam,
+    set_predictor_params,
     resize_with_aspect_ratio,
     clean_mask,
-    enhance_medical_image
+    enhance_medical_image,
+    draw_tangent,
+    tag_cobb
 )
 from helpers.diagnostics import (
-    classify_scoliosis_type,
     calculate_advanced_diagnostics
 )
 
@@ -38,6 +40,8 @@ model_choice = st.sidebar.selectbox(
 )
 
 predictor = get_predictor(model_choice)
+
+predictor_settings = set_predictor_params(model_choice)
 
 # Modul de selecție: Adăugare sau Ștergere
 mode = st.sidebar.radio(
@@ -153,11 +157,13 @@ if uploaded_file:
         if len(st.session_state["box"]) == 2:
             p1 = st.session_state["box"][0]
             p2 = st.session_state["box"][1]
+            xmin, xmax = min(p1[0], p2[0]), max(p1[0], p2[0])
+            ymin, ymax = min(p1[1], p2[1]), max(p1[1], p2[1])
             
             # Creăm box-ul doar dacă avem ambele puncte
             input_box = np.array([
-                min(p1[0], p2[0]), min(p1[1], p2[1]), 
-                max(p1[0], p2[0]), max(p1[1], p2[1])
+                xmin, ymin, 
+                xmax, ymax
             ])
             
             # Adăugăm batch dimension [1, 4] pentru SAM/MedSAM
@@ -169,22 +175,38 @@ if uploaded_file:
             
             predictor.set_image(medical_image)
 
-            # Combinăm BOX-ul cu PUNCTELE
-            input_box = np.array(st.session_state["box"])
-            input_pts = np.array(st.session_state["points"]) if st.session_state["points"] else None
-            input_lbl = np.array(st.session_state["labels"]) if st.session_state["labels"] else None
-            
-            # Predicție folosind punctele pozitive și negative
+            if len(st.session_state["box"]) == 2:
+                filtered_points = []
+                filtered_labels = []
+
+                for pt, lbl in zip(st.session_state["points"], st.session_state["labels"]):
+                    # Păstrăm punctul DOAR dacă este în interiorul Box-ului
+                    if xmin <= pt[0] <= xmax and ymin <= pt[1] <= ymax:
+                        filtered_points.append(pt)
+                        filtered_labels.append(lbl)
+                    else:
+                        # Opțional: Poți afișa un mesaj de avertizare în Streamlit
+                        st.sidebar.warning(f"Punctul de la {pt} a fost ignorat (este în afara Box-ului).")
+
+                # Folosim listele filtrate pentru AI
+                input_pts = np.array(filtered_points) if filtered_points else None
+                input_lbl = np.array(filtered_labels) if filtered_labels else None
+            else:
+                # Folosim listele filtrate pentru AI
+                input_pts = np.array(st.session_state["points"]) if st.session_state["points"] else None
+                input_lbl = np.array(st.session_state["labels"]) if st.session_state["labels"] else None
+
+            # Predicție folosind punctele pozitive și negative din box
             if input_box_final is not None:
                 masks, scores, _ = predictor.predict(
-                    point_coords=np.array(st.session_state["points"]),
-                    point_labels=np.array(st.session_state["labels"]),
+                    point_coords=input_pts,
+                    point_labels=input_lbl,
                     box=input_box_final,
-                    multimask_output=False
+                    multimask_output=predictor_settings[0]
                 )
 
-                # Alegem masca medie (index 1) - de obicei cea mai bună pentru organe/oase
-                mask_idx = 0 
+                # Alegem masca - de obicei cea mai bună pentru organe/oase
+                mask_idx = predictor_settings[1] 
                 best_mask = masks[mask_idx]
                 mask_uint8 = (best_mask.astype(np.uint8) * 255)
 
@@ -195,8 +217,7 @@ if uploaded_file:
                 # Afișăm scorul de încredere al AI-ului
                 st.caption(f"Scor încredere segmentare: {scores[mask_idx]:.2f}")
 
-                # Calculăm unghiul pe masca rezultată
-                #mask_final = clean_mask(mask_uint8)
+                # calculam metrici pe masca rezultată
                 results = calculate_advanced_diagnostics(mask_uint8)
 
             
@@ -208,47 +229,78 @@ if uploaded_file:
     
             if results:
                 # Vizualizarea axei coloanei
-                viz_mask = cv2.cvtColor(mask_uint8, cv2.COLOR_GRAY2RGB)
-                h, w = mask_uint8.shape[:2]
-                # 1. Desenăm axul central netezit al coloanei (linia albastră subțire)
+                display_image = np.array(img).copy()
+                mask_rgb = cv2.cvtColor(mask_uint8, cv2.COLOR_GRAY2RGB)
+                
+                # Facem masca verde semitransparentă (doar unde este alb)
+                mask_rgb[np.where((mask_rgb == [255, 255, 255]).all(axis=2))] = [0, 255, 0]
+                display_image = cv2.addWeighted(display_image, 0.8, mask_rgb, 0.2, 0)
+                h, w = display_image.shape[:2]
+                
+                # Desenăm axul central netezit al coloanei (linia albastră subțire)
                 cx, cy = results["curve_points"]
                 pts = np.array([np.transpose(np.vstack([cx, cy]))], np.int32)
-                cv2.polylines(viz_mask, pts, False, (0, 100, 255), 2)
+                cv2.polylines(display_image, pts, False, (0, 100, 255), 2)
 
-                # 2. Funcție pentru a desena tangenta (linia de diagnostic)
-                def draw_tangent(img, x, y, slope, color):
-                    length = w // 4 # Lungimea liniei de diagnostic
-                    # Calculăm punctele de capăt folosind panta
-                    dx = length / np.sqrt(1 + slope**2)
-                    dy = slope * dx
-                    p1 = (int(x - dx), int(y - dy))
-                    p2 = (int(x + dx), int(y + dy))
-                    cv2.line(img, p1, p2, color, 4)
-                    cv2.circle(img, (int(x), int(y)), 6, (255, 255, 255), -1)
+                # Desenăm punctele de INFLEXIUNE (Galben)
+                for (ix, iy) in results["inflection_points"]:
+                    # Un cerc cu marginea neagră pentru vizibilitate
+                    cv2.circle(display_image, (ix, iy), 8, (0, 255, 255), -1) 
+                    cv2.circle(display_image, (ix, iy), 9, (0, 0, 0), 1)
+                    cv2.putText(display_image, "Inflexiune", (ix + 15, iy - 15), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+                k = 0
+                for (ax, ay, k) in results["apical_points"]:
+                    cv2.drawMarker(display_image, (int(ax), int(ay)), (255, 0, 255), cv2.MARKER_DIAMOND, 15, 3)
+                    cv2.putText(display_image, "APEX", (int(ax) + 15, int(ay) - 15), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
                 
-                draw_tangent(viz_mask, *results["pt_max"], (255, 0, 0)) # Albastru pentru max
-                draw_tangent(viz_mask, *results["pt_min"], (0, 255, 0)) # Verde pentru min
 
-                cx1, cy1, cx2, cy2 = results['debug_pts']
-                #cv2.line(viz_mask, (int(cx1-20), int(cy1)), (int(cx1+20), int(cy1)), (255, 0, 0), 5)
-                #cv2.line(viz_mask, (int(cx2-20), int(cy2)), (int(cx2+20), int(cy2)), (0, 255, 0), 5)
-                cv2.circle(viz_mask, (int(cx1), int(cy1)), 10, (255, 0, 0), -1)
-                cv2.circle(viz_mask, (int(cx2), int(cy2)), 10, (0, 255, 0), -1)
+                # Desenăm perechile de linii pentru fiecare curbă
+                sample_y = results["sample_y"]
+                p_func = results["poly_func"] 
+                derivative_func = np.polyder(p_func)
+                indexare = 0
+                for curve in results["curves"]:
+                    # Extragem coordonatele pentru idx_max și idx_min din acest segment
+                    y_max_val = sample_y[curve['idx_max']]
+                    y_min_val = sample_y[curve['idx_min']]
+                    
+                    # desenare:
+                    draw_tangent(display_image, p_func(y_max_val), y_max_val, derivative_func(y_max_val), w, (255, 0, 0))
+                    draw_tangent(display_image, p_func(y_min_val), y_min_val, derivative_func(y_min_val), w, (0, 255, 0))
+                    tag_cobb(display_image, p_func(y_min_val), y_min_val, y_max_val, indexare)
+                    indexare += 1
+                
     
-                st.image(viz_mask, use_container_width=True)
-                st.caption("Liniile de înclinație Cobb si punctele de inflexiune")            
+                st.image(display_image, use_container_width=True)
+                st.caption("Liniile de înclinație Cobb, punctele de inflexiune si de APEX")  
 
-                c1, c2 = st.columns(2)
-                c1.metric("Unghi Cobb", f"{results['angle']}°")
-                c2.metric("Tipologie", results['type'])
+                # Afișăm metrici pentru toate curburile detectate
+                n_curves = len(results.get("curves", []))
+                if n_curves > 0:
+                    cols = st.columns(len(results["curves"]))
+                    max_angles = 0
+                    for idx, curve in enumerate(results["curves"]):
+                        label = "Curbură Principală" if idx == 0 else f"Curbură Secundară {idx}"
+                        cols[idx].metric(label, f"{curve['value']}°")
+                        if max_angles < curve['value']:
+                            max_angles = curve['value']
 
-                # Clasificare medicală automată (2026 Guidelines)
-                if results['angle'] < 10:
-                    st.success("Aliniament Normal")
-                elif 10 <= results['angle'] < 20:
-                    st.warning("Scolioză Ușoară (Monitorizare recomandată)")
+                    c1, c2 = st.columns(2)
+                    c1.metric("Tipologie", results['type'])
+                    c2.metric(label="Intensitate Curbură (Kappa)", value=f"{k:.5f}")
+
+                    # Clasificare medicală automată (2026 Guidelines)
+                    if max_angles < 10:
+                        st.success("Aliniament Normal")
+                    elif 10 <= max_angles < 20:
+                        st.warning("Scolioză Ușoară (Monitorizare recomandată)")
+                    else:
+                        st.error("Scolioză Semnificativă (Necesită intervenție)")
                 else:
-                    st.error("Scolioză Semnificativă (Necesită intervenție)")
+                    st.info("Nu au fost detectate curburi pentru analiză.")                    
 
     with col1:
         if results:
@@ -257,12 +309,12 @@ if uploaded_file:
             if st.button("Generează Raport PDF"):
                 # Salvăm masca temporar pentru a o pune în PDF
                 temp_mask_path = "temp_mask.png"
-                cv2.imwrite(temp_mask_path, cv2.cvtColor(viz_mask, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(temp_mask_path, cv2.cvtColor(display_image, cv2.COLOR_RGB2BGR))
                 
                 pdf_bytes = generate_pdf_report(
                     patient_name, 
-                    results['angle'], 
-                    results['type'], 
+                    results["curves"] if len(results["curves"]) > 0 else [], 
+                    results['type'] if len(results["curves"]) > 0 else '', 
                     temp_mask_path
                 )
                 
